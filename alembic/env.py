@@ -1,12 +1,14 @@
-from app.core.database import Base
-import app.models.user_model
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
-
+from app.core.database import Base
 from alembic import context
+import sys
+import os
 
+# Ye line aapke project ke root folder ka path alembic ko de degi
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
@@ -20,6 +22,8 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
+
+# Apne models/database file se Base import karein (path apne project ke mutabiq check kar lein)
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,

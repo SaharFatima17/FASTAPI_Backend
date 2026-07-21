@@ -37,3 +37,24 @@ class ChatMessage(Base):
 
     # Relationship back to ChatSession
     session = relationship("ChatSession", back_populates="messages")
+
+
+class Book(Base):
+    __tablename__ = "books"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    author = Column(String, nullable=False)
+    genre = Column(String)
+    total_copies = Column(Integer, default=1)
+    available_copies = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class Loan(Base):
+    __tablename__ = "loans"
+    id = Column(Integer, primary_key=True, index=True)
+    book_id = Column(Integer, ForeignKey("books.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    borrowed_at = Column(DateTime, default=datetime.datetime.utcnow)
+    due_date = Column(DateTime)
+    returned_at = Column(DateTime, nullable=True)
+    status = Column(String, default="borrowed") # 'borrowed' or 'returned'

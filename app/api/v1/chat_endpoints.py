@@ -1,113 +1,169 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
-from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
 import json
 import os
-import asyncio
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 from groq import AsyncGroq
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.core.database import get_db
 from app.models import ChatSession, ChatMessage
+from app.services.library_tools import (
+    search_books, check_availability, borrow_book, 
+    return_book, get_my_borrowed_books
+)
 
 load_dotenv()
-
 router = APIRouter(prefix="/chat", tags=["Chat"])
-
-# Groq Client Initialize
-groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-
-# 1. Moderation Check Function
-async def check_moderation(text: str) -> bool:
-    """
-    User input ko check karta hai ke wo safe hai ya nahi.
-    Groq ya kisi bhi lightweight model se moderation check karwaya ja sakta hai.
-    DUMMY SAFEGUARD: Aap real production mein OpenAI Moderation API ya HuggingFace use kar sakte hain.
-    Hum yahan check kar rahe hain ke agar content harmful keywords contain karta hai toh block karein.
-    """
-    harmful_keywords = ["how to make a bomb", "hack", "illegal", "self-harm"]
-    for word in harmful_keywords:
-        if word in text.lower():
-            return False  # Moderation failed
-    return True  # Safe
-
-# 2. Retry with Exponential Backoff decorator
-# Rate limit (429) aur Timeout errors par retry karega.
-# Pehla try fail hone par 2s wait karega, phir 4s, phir 8s... maximum 3 attempts tak.
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception_type(Exception),  # Production mein specific Groq API Errors par filter karein
-    reraise=True
+groq_client = AsyncGroq(
+    api_key=os.getenv("GROQ_API_KEY"),
+    timeout=60.0
 )
-async def call_groq_with_retry(messages, model="llama-3.3-70b-versatile"):
-    """Groq API call with built-in retry mechanisms."""
-    return await groq_client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=500,
-        stream=True
-    )
 
+# --- 1. TOOLS DEFINITION ---
+tools = [
+    {"type": "function", "function": {"name": "search_books", "description": "Search for books in the local library inventory by title or author.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "check_availability", "description": "Check if a book is available in the local library by ID.", "parameters": {"type": "object", "properties": {"book_id": {"type": "integer"}}, "required": ["book_id"]}}},
+    {"type": "function", "function": {"name": "borrow_book", "description": "Borrow a book from the local library by ID (Limit: 3).", "parameters": {"type": "object", "properties": {"book_id": {"type": "integer"}}, "required": ["book_id"]}}},
+    {"type": "function", "function": {"name": "return_book", "description": "Return a borrowed book to the local library by ID.", "parameters": {"type": "object", "properties": {"book_id": {"type": "integer"}}, "required": ["book_id"]}}},
+    {"type": "function", "function": {"name": "get_my_borrowed_books", "description": "View books I have currently borrowed from the library.", "parameters": {"type": "object", "properties": {}}}}
+]
+
+# --- 2. DATABASE LOGIC ---
+def handle_database_action(tool_name, arguments, db, user_id=1):
+    try:
+        args = json.loads(arguments) if arguments else {}
+        
+        if tool_name == "search_books":
+            results = search_books(db, args.get("query", ""))
+            return "Here are the books found in the local library inventory: " + ", ".join([f"'{b['title']}' (ID: {b['id']}, Author: {b['author']}, Available: {b['available']})" for b in results]) if results else "No books found matching that query in the library."
+        
+        elif tool_name == "check_availability":
+            res = check_availability(db, int(args.get("book_id", 0)))
+            if isinstance(res, str): return res
+            return f"'{res['title']}' is currently available. {res['available']} out of {res['total']} copies are ready for you."
+            
+        elif tool_name == "borrow_book":
+            return borrow_book(db, user_id, int(args.get("book_id", 0)))["reason"]
+            
+        elif tool_name == "return_book":
+            return return_book(db, user_id, int(args.get("book_id", 0)))["reason"]
+            
+        elif tool_name == "get_my_borrowed_books":
+            loans = get_my_borrowed_books(db, user_id)
+            if not loans: return "You don't have any books currently borrowed."
+            return "You currently have these books: " + ", ".join([f"Book ID {l['book_id']} (Due: {l['due_date']})" for l in loans])
+        
+        return "I'm sorry, I encountered an unknown action."
+    except Exception as e:
+        return f"I apologize, I had trouble processing that action. Error: {str(e)}"
+
+
+# --- 3. STREAMING ENDPOINT ---
 @router.get("/stream")
-async def chat_stream_endpoint(
-    message: str = Query(..., description="User's input message"),
-    session_key: str = Query("default_session"),
-    db: Session = Depends(get_db)
-):
-    # 1. Moderation Check
-    is_safe = await check_moderation(message)
-    if not is_safe:
-        return StreamingResponse(
-            (f"data: {json.dumps({'error': 'Your message violated our safety guidelines. Request blocked.'})}\n\n" for _ in range(1)),
-            media_type="text/event-stream"
-        )
-
-    # 2. Database Session check/create
-    chat_session = db.query(ChatSession).filter(ChatSession.session_key == session_key).first()
-    if not chat_session:
-        chat_session = ChatSession(session_key=session_key)
-        db.add(chat_session)
-        db.commit()
-        db.refresh(chat_session)
-
-    # 3. User Message Save
-    user_msg = ChatMessage(session_id=chat_session.id, sender="user", content=message)
-    db.add(user_msg)
-    db.commit()
-
+async def chat_stream_endpoint(message: str = Query(...), session_key: str = Query("default"), db: Session = Depends(get_db)):
+    
     async def event_generator():
         full_reply = ""
+        system_instructions = """You are Zylo, a professional, friendly, and helpful Library Assistant.
+        - STRICT INVENTORY RULES:
+          1. Whenever the user asks to search, check availability, or borrow/return a book by name or general description, you MUST ALWAYS call the appropriate tool ('search_books', 'check_availability', 'borrow_book') using the database tools.
+          2. If the user wants to borrow a book by name (e.g. 'Python programming book'), ALWAYS call 'search_books' first to find its ID, and then use that ID to call 'borrow_book'. Never guess or claim a book isn't in inventory without searching first.
+        - HYBRID CAPABILITY: For general world knowledge questions completely unrelated to the library inventory, use your global knowledge base directly.
+        - Respond in a natural, conversational tone.
+        - NEVER use tags like [System], [Error], or similar labels. Keep it clean."""
+        
+        messages = [
+            {"role": "system", "content": system_instructions},
+            {"role": "user", "content": message}
+        ]
+        
         try:
-            # 4. Call API with Retry wrapper
-            messages = [
-                {"role": "system", "content": "You are Zylo Core, a helpful and professional enterprise AI assistant."},
-                {"role": "user", "content": message}
-            ]
+            # First call non-streaming to safely catch tool calls if triggered
+            response = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile", 
+                messages=messages, 
+                tools=tools, 
+                tool_choice="auto", 
+                stream=False
+            )
             
-            response = await call_groq_with_retry(messages)
+            message_obj = response.choices[0].message
+            
+            if message_obj.tool_calls:
+                tool_call = message_obj.tool_calls[0]
+                tool_call_id = tool_call.id
+                tool_function_name = tool_call.function.name
+                tool_arguments_str = tool_call.function.arguments
+                
+                # Execute database action
+                db_result = handle_database_action(tool_function_name, tool_arguments_str, db)
+                
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_function_name,
+                                "arguments": tool_arguments_str
+                            }
+                        }
+                    ]
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": str(db_result)
+                })
 
-            async for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    token_text = chunk.choices[0].delta.content
-                    full_reply += token_text
-                    yield f"data: {json.dumps({'token': token_text})}\n\n"
-
-            # 5. DB mein complete response save karein
-            assistant_msg = ChatMessage(session_id=chat_session.id, sender="assistant", content=full_reply.strip())
-            db.add(assistant_msg)
-            db.commit()
-
-            print("\n" + "="*50)
-            print("📊 GROQ API USAGE STATS (With Retry & Moderation)")
-            print(f"🔹 Session Key:       {session_key}")
-            print(f"🔹 Model:             Llama 3.3 70B (Groq)")
-            print("="*50 + "\n")
+                # Second call to get final conversational response based on tool results
+                second_response = await groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile", 
+                    messages=messages,
+                    stream=False
+                )
+                
+                final_text = second_response.choices[0].message.content
+                if final_text:
+                    yield f"data: {json.dumps({'token': final_text})}\n\n"
+                    full_reply += final_text
+            else:
+                final_text = message_obj.content
+                if final_text:
+                    yield f"data: {json.dumps({'token': final_text})}\n\n"
+                    full_reply += final_text
 
         except Exception as e:
-            print(f"❌ Failed after retries. Error: {str(e)}")
-            yield f"data: {json.dumps({'error': 'System is currently busy. Please try again in a moment.'})}\n\n"
+            error_msg = f"I am having trouble processing your request right now."
+            yield f"data: {json.dumps({'token': error_msg})}\n\n"
+            full_reply += error_msg
+
+        # Save to database session (Auto-create session if it doesn't exist to prevent history loss on refresh)
+        session = db.query(ChatSession).filter(ChatSession.session_key == session_key).first()
+        if not session:
+            session = ChatSession(session_key=session_key)
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            
+        if session:
+            db.add(ChatMessage(session_id=session.id, sender="user", content=message))
+            db.add(ChatMessage(session_id=session.id, sender="assistant", content=full_reply))
+            db.commit()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+from fastapi import Query
+
+@router.get("/history")
+async def get_chat_history(session_key: str = Query("default"), db: Session = Depends(get_db)):
+    # Session find karein ya create karein
+    session = db.query(ChatSession).filter(ChatSession.session_key == session_key).first()
+    if not session:
+        return []
+    
+    # Messages fetch karein
+    messages = db.query(ChatMessage).filter(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at.asc()).all()
+    return [{"sender": m.sender, "content": m.content} for m in messages]
