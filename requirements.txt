@@ -5,3 +5,8 @@ psycopg2-binary>=2.9.0
 passlib[bcrypt]>=1.7.4
 pydantic[email]>=2.6.0
 alembic>=1.13.0
+langchain
+langchain-openai
+langchain-community
+langgraph
+python-dotenv
